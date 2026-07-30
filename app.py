@@ -1,26 +1,15 @@
 import re
 from collections import Counter
 
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 from datasets import load_dataset
 from nltk.stem.porter import PorterStemmer
+from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.metrics import accuracy_score, classification_report
-from wordcloud import WordCloud
-
-import re
-from collections import Counter
-
-import pandas as pd
-import matplotlib.pyplot as plt
-import streamlit as st
-from datasets import load_dataset
-from nltk.stem.porter import PorterStemmer
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import accuracy_score, classification_report
@@ -107,13 +96,71 @@ def train_model(df: pd.DataFrame):
 df = load_data()
 vectorizer, model, acc, report = train_model(df)
 
+
+# ----------------------------------------------------------------------------
+# RAG (Retrieval-Augmented Generation) — retrieval + penyusunan jawaban
+# ----------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Memuat model embedding...")
+def load_embedding_model():
+    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+
+@st.cache_data(show_spinner="Menghitung embedding seluruh dokumen review...")
+def compute_doc_embeddings(reviews: list) -> np.ndarray:
+    embed_model = load_embedding_model()
+    return embed_model.encode(reviews, show_progress_bar=False)
+
+
+def retrieve(query: str, knowledge_base: list, doc_embeddings: np.ndarray,
+             liked_labels: list, top_k: int = 5):
+    embed_model = load_embedding_model()
+    query_embedding = embed_model.encode([query])
+    similarities = cosine_similarity(query_embedding, doc_embeddings)[0]
+    top_indices = similarities.argsort()[::-1][:top_k]
+
+    results = []
+    for idx in top_indices:
+        results.append({
+            "doc_id": int(idx),
+            "text": knowledge_base[idx],
+            "similarity": float(similarities[idx]),
+            "liked": int(liked_labels[idx]),
+        })
+    return results
+
+
+def compose_answer(query: str, retrieved_docs: list) -> str:
+    """Menyusun jawaban (generation) berdasarkan dokumen hasil retrieval.
+    Menggunakan ringkasan berbasis statistik + kutipan dokumen teratas,
+    bukan model LLM generatif bebas (agar ringan & stabil untuk deployment)."""
+    n = len(retrieved_docs)
+    n_pos = sum(1 for d in retrieved_docs if d["liked"] == 1)
+    n_neg = n - n_pos
+
+    if n_pos > n_neg:
+        kesimpulan = f"cenderung **positif** ({n_pos} dari {n} review relevan bernada positif)"
+    elif n_neg > n_pos:
+        kesimpulan = f"cenderung **negatif** ({n_neg} dari {n} review relevan bernada negatif)"
+    else:
+        kesimpulan = f"**campuran** ({n_pos} positif, {n_neg} negatif dari {n} review relevan)"
+
+    top_doc = retrieved_docs[0]
+    jawaban = (
+        f"Berdasarkan {n} review pelanggan yang paling relevan dengan pertanyaan Anda, "
+        f"pendapat pelanggan {kesimpulan}. "
+        f"Review paling relevan (similarity {top_doc['similarity']:.2f}) menyatakan: "
+        f"\"{top_doc['text']}\""
+    )
+    return jawaban
+
+
 # ----------------------------------------------------------------------------
 # SIDEBAR NAVIGASI
 # ----------------------------------------------------------------------------
 st.sidebar.title("🍽️ Menu")
 page = st.sidebar.radio(
     "Pilih halaman",
-    ["🔮 Prediksi Sentimen", "📊 Eksplorasi Data (EDA)", "ℹ️ Tentang Proyek"],
+    ["🔮 Prediksi Sentimen", "🔎 Tanya Jawab (RAG)", "📊 Eksplorasi Data (EDA)", "ℹ️ Tentang Proyek"],
 )
 
 st.sidebar.markdown("---")
@@ -190,7 +237,55 @@ if page == "🔮 Prediksi Sentimen":
         del st.session_state["quick_example"]
 
 # ----------------------------------------------------------------------------
-# HALAMAN 2: EKSPLORASI DATA
+# HALAMAN 2: TANYA JAWAB (RAG)
+# ----------------------------------------------------------------------------
+elif page == "🔎 Tanya Jawab (RAG)":
+    st.title("🔎 Tanya Jawab Berbasis Review (RAG)")
+    st.write(
+        "Ajukan pertanyaan (Bahasa Indonesia atau Inggris) tentang review pelanggan restoran. "
+        "Sistem akan **mencari review paling relevan** (retrieval), **menyusun jawaban** "
+        "berdasarkan review tersebut (generation), dan **menampilkan dokumen referensinya**."
+    )
+
+    knowledge_base = df["Review"].tolist()
+    liked_labels = df["Liked"].tolist()
+    doc_embeddings = compute_doc_embeddings(knowledge_base)
+
+    query = st.text_input(
+        "Pertanyaan Anda:",
+        placeholder="Contoh: Bagaimana pendapat pelanggan tentang pelayanan di restoran?",
+    )
+    top_k = st.slider("Jumlah dokumen yang diambil (top-k)", min_value=3, max_value=10, value=5)
+
+    if st.button("Cari Jawaban", type="primary"):
+        if not query.strip():
+            st.warning("Silakan masukkan pertanyaan terlebih dahulu.")
+        else:
+            retrieved_docs = retrieve(query, knowledge_base, doc_embeddings, liked_labels, top_k)
+            jawaban = compose_answer(query, retrieved_docs)
+
+            st.subheader("💬 Jawaban")
+            st.info(jawaban)
+
+            st.subheader("📄 Referensi Dokumen yang Digunakan")
+            for i, ref in enumerate(retrieved_docs, 1):
+                sentimen = "🟢 Positif" if ref["liked"] == 1 else "🔴 Negatif"
+                st.write(f"**{i}.** [{ref['similarity']:.3f}] {sentimen} — {ref['text']}")
+
+    st.markdown("---")
+    st.subheader("Coba beberapa contoh pertanyaan")
+    example_questions = [
+        "Bagaimana kualitas makanan di restoran ini?",
+        "Is the food here expensive?",
+        "What are the most common complaints from customers?",
+        "Bagaimana suasana atau ambiance di tempat ini?",
+        "Apakah restoran ini direkomendasikan untuk dikunjungi?",
+    ]
+    for eq in example_questions:
+        st.code(eq, language=None)
+
+# ----------------------------------------------------------------------------
+# HALAMAN 3: EKSPLORASI DATA
 # ----------------------------------------------------------------------------
 elif page == "📊 Eksplorasi Data (EDA)":
     st.title("📊 Eksplorasi Data Review Restoran")
@@ -248,7 +343,7 @@ elif page == "📊 Eksplorasi Data (EDA)":
         st.dataframe(df[["Review", "Liked", "review_final"]].head(20))
 
 # ----------------------------------------------------------------------------
-# HALAMAN 3: TENTANG PROYEK
+# HALAMAN 4: TENTANG PROYEK
 # ----------------------------------------------------------------------------
 else:
     st.title("ℹ️ Tentang Proyek")
@@ -262,7 +357,10 @@ else:
            dan stemming (Porter Stemmer).
         2. **Ekstraksi fitur**: TF-IDF (Term Frequency – Inverse Document Frequency).
         3. **Klasifikasi sentimen**: Multinomial Naive Bayes.
-        4. **Eksplorasi data**: distribusi label, kata paling sering muncul, word cloud.
+        4. **Retrieval-Augmented Generation (RAG)**: pencarian review paling relevan
+           dengan `sentence-transformers` (retrieval), penyusunan jawaban dari
+           review yang ditemukan (generation), dan tampilan referensi dokumen.
+        5. **Eksplorasi data**: distribusi label, kata paling sering muncul, word cloud.
 
         **Dataset**: `KarthikaRajagopal/Restaurant_Reviews.tsv` dari HuggingFace Datasets.
 
