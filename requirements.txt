@@ -1,11 +1,11 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
 streamlit
 pandas
+numpy
 scikit-learn
 nltk
-datasets>=2.19.0
-pyarrow>=14.0.0
+datasets
 wordcloud
 matplotlib
 sentence-transformers
+torch
+huggingface_hub
