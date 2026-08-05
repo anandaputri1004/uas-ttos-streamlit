@@ -4,7 +4,8 @@ streamlit
 pandas
 scikit-learn
 nltk
-datasets
+datasets>=2.19.0
+pyarrow>=14.0.0
 wordcloud
 matplotlib
 sentence-transformers
